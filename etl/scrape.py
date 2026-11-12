@@ -38,6 +38,10 @@ every leaderboard is biased high.
 Why the `-zzqqxx` keyword: the Actor rejects an empty keyword, but any real
 keyword silently drops listings that don't contain that word. A nonsense
 NEGATIVE keyword excludes nothing, so it behaves as a full category browse.
+It only works with `exactMatch: false`. The Actor added `exactMatch` around
+2026-11-10, defaulting to true, which drops every listing that doesn't
+"closely match" the keyword -- and nothing matches `-zzqqxx`. Runs then
+SUCCEEDED with 0 rows (or FAILED) and the daily refresh died two days running.
 
 Why price bands: a single eBay search caps out near 10,000 results, and the
 Actor OOMs past roughly 3,000 rows in one run. Bands solve both at once.
@@ -128,6 +132,7 @@ def start(cat, lo, hi, token, days, attempts=4):
         "categoryId": cat, "ebaySite": "ebay.com",
         "sortOrder": "endedRecently", "minPrice": lo,
         "includeCompletedListings": True,
+        "exactMatch": False,       # see module docstring: default True returns 0 rows
     }
     if hi:
         inp["maxPrice"] = hi
