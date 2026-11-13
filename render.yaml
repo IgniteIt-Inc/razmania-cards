@@ -15,6 +15,9 @@ services:
     plan: starter              # $7/mo. The free plan sleeps after 15 min and cold-starts ~1 min.
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn api.main:app --host 0.0.0.0 --port $PORT
+    # Explicit so a dashboard toggle cannot quietly stop the API from picking
+    # up a push. Omitting this leaves whatever the service was last set to.
+    autoDeployTrigger: commit
     healthCheckPath: /v1/health
     envVars:
       - key: DATABASE_URL
@@ -36,7 +39,14 @@ services:
     plan: starter              # billed per second; ~15 min/day => well under $1/mo
     schedule: "0 9 * * *"
     buildCommand: pip install -r requirements.txt
-    startCommand: ./etl/refresh_daily.sh
+    # Invoke bash explicitly. The script is not (and was never) mode 755 in
+    # git, and Render executes startCommand directly — `./etl/refresh_daily.sh`
+    # is "Permission denied" on a 644 file. Bash does not need the +x bit.
+    # autoDeployTrigger is explicit for the same reason as the web service:
+    # the Nov 12 scrape fix was on main before two 09:00 UTC runs, and neither
+    # loaded a row.
+    startCommand: /bin/bash etl/refresh_daily.sh
+    autoDeployTrigger: commit
     envVars:
       - key: DATABASE_URL
         fromDatabase: { name: razmania-db, property: connectionString }

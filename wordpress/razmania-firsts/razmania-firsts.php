@@ -2,7 +2,7 @@
 /**
  * Plugin Name: RazMania Firsts
  * Description: Firsts — one to three card-market milestones a day, each its own article at /firsts/<id>-<slug>/, plus the series page with the hand-researched all-time firsts. Articles are rendered by the card-data API and hosted here server-side, so Google sees the full text, the NewsArticle markup and the numbers on the first pass.
- * Version:     2.0.0
+ * Version:     2.0.1
  * Author:      RazMania
  *
  * A separate plugin, like razmania-index, so nothing here can overwrite the
@@ -19,14 +19,15 @@
  * ROUTES (virtual, like the exhibitors plugin)
  *   /firsts/<id>-<slug>/      one milestone as a news article (API fragment, hosted here)
  *   /firsts/<id>/             same, redirects to the slugged URL
- *   /firsts-sitemap.xml       every published article, for Google News / Top Stories
+ *   /firsts/sitemap.xml       every published article, for Google News / Top Stories
+ *   /firsts-sitemap.xml       301 to /firsts/sitemap.xml (Rank Math owns every *-sitemap.xml)
  * The series page itself is a normal WordPress page at /firsts/ carrying
  * [razmania_firsts]; the rewrite rules only claim paths beneath it.
  */
 
 if (!defined('ABSPATH')) exit;
 
-define('RZF_VERSION',   '2.0.0');
+define('RZF_VERSION',   '2.0.1');
 define('RZF_DIR',       plugin_dir_path(__FILE__));
 define('RZF_CACHE_TTL', 30 * MINUTE_IN_SECONDS);
 
@@ -107,7 +108,7 @@ function rzf_settings_page() {
 [razmania_firsts_cards]                 the per-card all-time profiles
 [razmania_firsts_strip]                 four all-time tiles, one per category</pre>
       <p><a href="<?php echo esc_url(admin_url('options-general.php?page=rzf&rzf_flush=1')); ?>">Clear cached API responses</a>
-         · <a href="<?php echo esc_url(home_url('/firsts-sitemap.xml')); ?>">Article sitemap</a></p>
+         · <a href="<?php echo esc_url(home_url('/firsts/sitemap.xml')); ?>">Article sitemap</a></p>
     </form></div>
 <?php }
 
@@ -128,25 +129,47 @@ function rzf_vertical($name) {
     return null;
 }
 
-function rzf_get($path, $ttl = RZF_CACHE_TTL) {
+function rzf_get($path, $ttl = RZF_CACHE_TTL, $timeout = 15, $retries = 0) {
     $base = rzf_api_base();
     if (!$base) return new WP_Error('rzf', 'API base URL not set');
     $key = 'rzf_' . md5($base . $path);
     $hit = get_transient($key);
     if ($hit !== false) return $hit;
-    $args = ['timeout' => 12, 'headers' => ['Accept' => 'application/json']];
+    $args = ['timeout' => $timeout, 'headers' => ['Accept' => 'application/json']];
     if ($k = rzf_api_key()) $args['headers']['x-api-key'] = $k;
-    $res = wp_remote_get($base . $path, $args);
-    $ok  = !is_wp_error($res) && wp_remote_retrieve_response_code($res) === 200;
-    if (!$ok) {
+
+    $res = null;
+    $attempts = max(1, (int)$retries + 1);
+    for ($i = 0; $i < $attempts; $i++) {
+        $res = wp_remote_get($base . $path, $args);
+        $code = is_wp_error($res) ? 0 : (int)wp_remote_retrieve_response_code($res);
+        // A real miss. Never store it: a cached 404 is how an article that
+        // later exists (or a slow API) stays missing.
+        if ($code === 404) {
+            delete_transient($key);
+            delete_transient($key . '_stale');
+            return new WP_Error('rzf_missing', 'API returned 404');
+        }
+        if ($code === 200) break;
+        // One more try only for a timeout or a 5xx. Other 4xx won't improve.
+        if ($i + 1 >= $attempts || ($code !== 0 && $code < 500)) break;
+    }
+
+    $code = is_wp_error($res) ? 0 : (int)wp_remote_retrieve_response_code($res);
+    if ($code !== 200) {
         // A first never changes once served, so a stale copy is not wrong, only
-        // incomplete. Serve it rather than an error.
+        // incomplete. Serve it rather than an error. Do not cache the failure.
         $stale = get_transient($key . '_stale');
         if ($stale !== false) return $stale;
         return is_wp_error($res) ? $res
-             : new WP_Error('rzf', 'API returned ' . wp_remote_retrieve_response_code($res));
+             : new WP_Error('rzf', 'API returned ' . $code);
     }
     $data = json_decode(wp_remote_retrieve_body($res), true);
+    if (!is_array($data)) {
+        $stale = get_transient($key . '_stale');
+        if ($stale !== false) return $stale;
+        return new WP_Error('rzf', 'API returned a non-JSON body');
+    }
     set_transient($key, $data, $ttl);
     set_transient($key . '_stale', $data, WEEK_IN_SECONDS);
     return $data;
@@ -435,9 +458,23 @@ add_filter('the_content', function ($content) {
 function rzf_add_rules() {
     add_rewrite_rule('^firsts/(\d+)-([a-z0-9\-]+)/?$', 'index.php?rzf=article&rzf_id=$matches[1]&rzf_slug=$matches[2]', 'top');
     add_rewrite_rule('^firsts/(\d+)/?$', 'index.php?rzf=article&rzf_id=$matches[1]', 'top');
-    add_rewrite_rule('^firsts-sitemap\.xml$', 'index.php?rzf=sitemap', 'top');
+    // Under /firsts/, not /firsts-sitemap.xml. Rank Math registers
+    // ([^/]+)-sitemap([0-9]+)?.xml at the top of the rewrite list and 404s
+    // any name it doesn't own, which is why resaving permalinks never helped.
+    // /companies/sitemap.xml on this site already proves the slash form is left alone.
+    add_rewrite_rule('^firsts/sitemap\.xml$', 'index.php?rzf=sitemap', 'top');
 }
 add_action('init', 'rzf_add_rules');
+// Earlier than Rank Math's sitemap router, and independent of whose rewrite
+// rule wins. The old URL 301s even when Rank Math still claims it.
+add_action('init', function () {
+    if (is_admin()) return;
+    $path = parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH);
+    if ($path && preg_match('#/firsts-sitemap\.xml$#', $path)) {
+        wp_safe_redirect(home_url('/firsts/sitemap.xml'), 301);
+        exit;
+    }
+}, 0);
 add_filter('query_vars', function ($v) { $v[] = 'rzf'; $v[] = 'rzf_id'; $v[] = 'rzf_slug'; return $v; });
 register_activation_hook(__FILE__, function () { rzf_add_rules(); flush_rewrite_rules(); update_option('rzf_rules_version', RZF_VERSION); });
 register_deactivation_hook(__FILE__, 'flush_rewrite_rules');
@@ -453,9 +490,11 @@ add_action('template_redirect', function () {
     $id = (int)get_query_var('rzf_id');
     if (!$id) return;
     // The article comes from the API as a fragment plus meta; a day's cache,
-    // because a first never changes once published.
-    $a = rzf_get('/firsts/a/' . $id . '?fragment=1' . rzf_site_q(), DAY_IN_SECONDS);
-    if (is_wp_error($a) || empty($a['html'])) { $wp_query->set_404(); status_header(404); nocache_headers(); return; }
+    // because a first never changes once published. 20s + one retry: the
+    // unindexed subject scan took ~50s and the old 12s timeout became a 404.
+    $a = rzf_get('/firsts/a/' . $id . '?fragment=1' . rzf_site_q(), DAY_IN_SECONDS, 20, 1);
+    if (is_wp_error($a) && $a->get_error_code() === 'rzf_missing') rzf_finish_status(404);
+    if (is_wp_error($a) || empty($a['html'])) rzf_finish_status(503);
     $meta = $a['meta'];
     $canon = rzf_article_url($id, $meta['title']);
     if (trailingslashit(home_url(add_query_arg([], $GLOBALS['wp']->request))) !== $canon) { wp_redirect($canon, 301); exit; }
@@ -539,7 +578,35 @@ function rzf_render_sitemap() {
     }
     echo '</urlset>';
 }
-add_filter('robots_txt', function ($out) { return rtrim($out) . "\nSitemap: " . home_url('/firsts-sitemap.xml') . "\n"; });
+add_filter('robots_txt', function ($out) { return rtrim($out) . "\nSitemap: " . home_url('/firsts/sitemap.xml') . "\n"; });
+
+/** 404 only when the article does not exist. A slow or down API is a 503.
+ *  Either way, exit from here. Returning let the theme's 404 template (and
+ *  the host's 31-day HTML cache) replace nocache_headers() with
+ *  `max-age=2678400`, so a timed-out article stayed missing for a month. */
+function rzf_finish_status($code) {
+    if (!defined('DONOTCACHEPAGE')) define('DONOTCACHEPAGE', true);
+    nocache_headers();
+    if (!headers_sent()) {
+        header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+        header('Pragma: no-cache');
+        header('Expires: Wed, 11 Jan 1984 05:00:00 GMT');
+        header('CDN-Cache-Control: no-store');
+        header('Cloudflare-CDN-Cache-Control: no-store');
+    }
+    if ((int)$code === 404) {
+        global $wp_query;
+        $wp_query->set_404();
+        status_header(404);
+        $tpl = function_exists('get_404_template') ? get_404_template() : '';
+        if ($tpl) { include $tpl; exit; }
+        wp_die('Not found', 'Not found', ['response' => 404]);
+    }
+    status_header(503);
+    header('Retry-After: 120');
+    wp_die('This article is temporarily unavailable. Please try again in a few minutes.',
+           'Temporarily unavailable', ['response' => 503]);
+}
 
 /* ------------------------------------------------------------------ styles */
 add_action('wp_enqueue_scripts', function () {

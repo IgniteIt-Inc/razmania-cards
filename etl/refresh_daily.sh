@@ -1,10 +1,31 @@
 #!/usr/bin/env bash
-# Daily refresh. Any failing step aborts so a partial load can never silently
-# become "today's data".
+# Daily refresh. A hard failure aborts. A tier that finds no rows does not:
+# that used to discard the other tier's scrape before load.py ever saw it.
+# The freshness gate at the end still fails the run if the data is stale.
 set -euo pipefail
 
 : "${DATABASE_URL:?set DATABASE_URL}"
 : "${APIFY_TOKEN:?set APIFY_TOKEN}"
+
+# RENDER_GIT_COMMIT is set by Render. The Nov 12 exactMatch fix was on main
+# for two scheduled runs that never loaded a row; this line is how the log
+# proves which build actually executed.
+echo "==> commit ${RENDER_GIT_COMMIT:-unknown}"
+
+# A tier that finds nothing exits 2. That must not throw away the other
+# tier's files: with `set -e`, a tail scrape of zero rows used to abort
+# before load.py, so a good hot scrape never reached the database.
+run_scrape() {
+  set +e
+  python3 etl/scrape.py "$@"
+  local rc=$?
+  set -e
+  if [ "$rc" -eq 2 ]; then
+    echo "WARN: that tier returned no rows; continuing so other tiers still load"
+    return 0
+  fi
+  return "$rc"
+}
 
 MIN_PRICE=${MIN_PRICE:-2000}      # nothing below this is collected or published
 HOT_FLOOR=${HOT_FLOOR:-10000}     # the slice that gets a DAILY scrape
@@ -73,7 +94,7 @@ HOT_DAYS=$(( HOT_BASE + 2 )); [ "$HOT_DAYS" -gt 6 ] && HOT_DAYS=6
 
 echo "==> HOT  \$$HOT_FLOOR+ : ${HOT_BASE}d behind -> ${HOT_DAYS}d window"
 echo "==> 1/4 scraping"
-python3 etl/scrape.py --out "$WORK/raw" --days "$HOT_DAYS" --min-price "$HOT_FLOOR"
+run_scrape --out "$WORK/raw" --days "$HOT_DAYS" --min-price "$HOT_FLOOR"
 
 # --------------------------------------------- TAIL tier, every TAIL_EVERY days
 # CADENCE AND WINDOW MOVE TOGETHER, OR THE CHANGE IS WORSE THAN USELESS.
@@ -104,7 +125,7 @@ if [ "$TAIL_EVERY" -gt 0 ]; then
     [ "$TAIL_DAYS" -lt $(( TAIL_EVERY + 1 )) ] && TAIL_DAYS=$(( TAIL_EVERY + 1 ))
     [ "$TAIL_DAYS" -gt $(( TAIL_EVERY + 2 )) ] && TAIL_DAYS=$(( TAIL_EVERY + 2 ))
     echo "==> TAIL \$$MIN_PRICE-$((HOT_FLOOR-1)) : ${TAIL_BASE}d behind -> ${TAIL_DAYS}d window (every ${TAIL_EVERY}d)"
-    python3 etl/scrape.py --out "$WORK/raw" --days "$TAIL_DAYS" \
+    run_scrape --out "$WORK/raw" --days "$TAIL_DAYS" \
             --min-price "$MIN_PRICE" --max-price "$((HOT_FLOOR - 1))"
   else
     echo "==> TAIL skipped (${TAIL_BASE}d behind, cadence is ${TAIL_EVERY}d)"

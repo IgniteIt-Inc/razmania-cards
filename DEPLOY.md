@@ -189,10 +189,12 @@ Ships in three pieces, none of which touches the live `razmania-cards` plugin:
 Verify, in this order: `curl -H "x-api-key: …" <api>/v1/firsts?days=1` shows
 today's picks; open one `/firsts/<id>-<slug>/` and view source — headline,
 standfirst, prices and the `NewsArticle` JSON-LD must be in the raw HTML;
-`/firsts-sitemap.xml` lists it with a `news:news` block; the homepage shows
-the three cards above the content. Then submit `/firsts-sitemap.xml` in
+`/firsts/sitemap.xml` lists it with a `news:news` block; the homepage shows
+the three cards above the content. Then submit `/firsts/sitemap.xml` in
 Search Console and request Google News Publisher Center inclusion for
-`/firsts/`.
+`/firsts/`. Do not submit `/firsts-sitemap.xml`: Rank Math owns every
+`*-sitemap.xml` path and 404s that URL. The plugin 301s it to
+`/firsts/sitemap.xml`.
 
 Editorial rules that outrank everything else: a tracked first is never
 called "first ever", and **never fill an "open" all-time cell from memory.**
