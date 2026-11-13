@@ -196,7 +196,11 @@ def main():
 
     bands = bands_for(args.min_price, args.max_price)
     ceiling = f"${args.max_price:,}" if args.max_price else "up"
-    print(f"range=${args.min_price:,}-{ceiling} days={args.days} bands={len(bands)}")
+    # exactMatch=false is load-bearing: the actor defaults it to true, and a
+    # true value drops every -zzqqxx row. Printed so a cron log shows the
+    # build that is actually running.
+    print(f"range=${args.min_price:,}-{ceiling} days={args.days} bands={len(bands)} "
+          f"exactMatch=false keyword=-zzqqxx")
     started, total, failed = [], 0, []
     for cat, lo, hi in bands:
         try:
@@ -211,6 +215,19 @@ def main():
         st = wait(run_id, token)
         rows = download(ds_id, out, token)     # partial data from a failed run is
         total += rows                          # still real data — keep it.
+        # A FAILED/empty band is usually a transient Apify or eBay blip (Nov 11
+        # the runs FAILED outright). One retry. Rows already in hand are kept
+        # either way — a retry that also fails must not discard them.
+        if st != "SUCCEEDED" and rows == 0:
+            print(f"  retry cat={cat} ${lo}-{hi or 'up'}: {st} with 0 rows")
+            time.sleep(5)
+            try:
+                run_id, ds_id = start(cat, lo, hi, token, args.days)
+                st = wait(run_id, token)
+                rows = download(ds_id, out, token)
+                total += rows
+            except urllib.error.HTTPError as e:                   # noqa: PERF203
+                failed.append((cat, lo, hi, f"retry start failed: {e}"))
         print(f"  cat={cat} ${lo}-{hi or 'up'} {st} -> {rows:,} rows")
         if st != "SUCCEEDED":
             failed.append((cat, lo, hi, st))
@@ -222,7 +239,11 @@ def main():
     for f in failed:
         print("  WARN:", f)
     if total == 0:
-        sys.exit("FAIL: scrape returned no rows at all")
+        # Exit 2, not 1. refresh_daily.sh treats 2 as "this tier found nothing"
+        # and still loads whatever the other tier wrote. Exit 1 is a hard
+        # failure (bad token, Apify down) and aborts the run.
+        print("FAIL: scrape returned no rows at all")
+        sys.exit(2)
 
 
 if __name__ == "__main__":

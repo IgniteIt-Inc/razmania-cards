@@ -11,9 +11,12 @@ main.py) and server-rendered HTML under /firsts (public, like the embeds).
   GET /firsts/                      index of published days (preview)
 
 Every number on the article is read from a materialized view or a single
-indexed scan and cached by the CDN and by WordPress; nothing aggregates the
-whole table per request except the subject block, which is one filtered scan
-over a few tens of thousands of rows and is cached with the page.
+indexed scan and cached by the CDN and by WordPress. The subject block used
+to call firsts_subject() across the whole vertical — a regex, so it cannot
+use an index — four times per article. On the live table that was a 30–50s
+response with nothing on the wire until the end, and WordPress gave up.
+Named subjects now go through an indexed predicate (player, or a trigram
+match on the title for Pokémon).
 
 The article is honest by construction: every claim is "tracked by RazMania
 since <first day>", the floor is printed, and a first is never described as
@@ -202,6 +205,43 @@ def subject_name(m):
     return None
 
 
+_SUBJECT_COLS = """item_id, title, total_price, sold_date, grade_label, listing_format,
+                   bids, url, image_url, vertical, player"""
+
+
+def subject_source(vertical, name):
+    """A FROM-item plus params for one named subject. Always a subquery
+    aliased `subj`, so callers can add an outer WHERE.
+
+    Sports subjects are the parsed player (sales_player_idx). Pokémon have no
+    player column; the name is a token in the title. The trigram ILIKE runs
+    inside a MATERIALIZED CTE so the planner cannot flatten firsts_subject()
+    — a regex, not indexable — back into a scan of the whole vertical. That
+    scan was the 30–50s article response. The function then keeps the word
+    boundary (Mew is not Mewtwo) on the small hit set only.
+    """
+    if vertical == "Pokemon":
+        return (
+            f"""(
+                WITH hit AS MATERIALIZED (
+                    SELECT {_SUBJECT_COLS}
+                    FROM sales
+                    WHERE is_publishable AND vertical = %s AND title ILIKE %s
+                )
+                SELECT * FROM hit WHERE firsts_subject(vertical, player, title) = %s
+            ) subj""",
+            (vertical, f"%{name}%", name),
+        )
+    return (
+        f"""(
+            SELECT {_SUBJECT_COLS}
+            FROM sales
+            WHERE is_publishable AND vertical = %s AND player = %s
+        ) subj""",
+        (vertical, name),
+    )
+
+
 def bundle(mid):
     rows = q("SELECT * FROM firsts_log WHERE id = %s", (mid,))
     if not rows:
@@ -232,27 +272,24 @@ def bundle(mid):
     # The subject in numbers, computed live for players and Pokémon alike.
     name = subject_name(m)
     if name:
-        st = q("""SELECT count(*) AS sales, sum(total_price) AS gmv,
+        src, pp = subject_source(v, name)
+        st = q(f"""SELECT count(*) AS sales, sum(total_price) AS gmv,
                          percentile_cont(0.5) WITHIN GROUP (ORDER BY total_price) AS median_price,
                          percentile_cont(0.25) WITHIN GROUP (ORDER BY total_price) AS p25,
                          percentile_cont(0.75) WITHIN GROUP (ORDER BY total_price) AS p75,
                          max(total_price) AS top_sale, min(sold_date) AS first_seen, max(sold_date) AS last_sold
-                  FROM sales WHERE is_publishable AND vertical = %s
-                    AND firsts_subject(vertical, player, title) = %s""", (v, name))[0]
+                  FROM {src}""", pp)[0]
         if st["sales"]:
             b["subject"] = {"name": name, **st}
-            b["subject_recent"] = q("""SELECT item_id, title, total_price, sold_date, grade_label, listing_format, bids, url, image_url
-                                       FROM sales WHERE is_publishable AND vertical = %s
-                                         AND firsts_subject(vertical, player, title) = %s
-                                       ORDER BY sold_date DESC, total_price DESC LIMIT 8""", (v, name))
-            b["subject_top"] = q("""SELECT item_id, title, total_price, sold_date, grade_label, url, image_url
-                                    FROM sales WHERE is_publishable AND vertical = %s
-                                      AND firsts_subject(vertical, player, title) = %s
-                                    ORDER BY total_price DESC LIMIT 5""", (v, name))
-            b["subject_daily"] = q("""SELECT sold_date, count(*) AS n, sum(total_price) AS gmv, max(total_price) AS top
-                                      FROM sales WHERE is_publishable AND vertical = %s
-                                        AND firsts_subject(vertical, player, title) = %s
-                                      GROUP BY sold_date ORDER BY sold_date""", (v, name))
+            b["subject_recent"] = q(f"""SELECT item_id, title, total_price, sold_date, grade_label, listing_format, bids, url, image_url
+                                       FROM {src}
+                                       ORDER BY sold_date DESC, total_price DESC LIMIT 8""", pp)
+            b["subject_top"] = q(f"""SELECT item_id, title, total_price, sold_date, grade_label, url, image_url
+                                    FROM {src}
+                                    ORDER BY total_price DESC LIMIT 5""", pp)
+            b["subject_daily"] = q(f"""SELECT sold_date, count(*) AS n, sum(total_price) AS gmv, max(total_price) AS top
+                                      FROM {src}
+                                      GROUP BY sold_date ORDER BY sold_date""", pp)
             b["comps"] = q("""SELECT card_year, brand_set, card_number, parallel, grade_label, sales, median_price, p25, p75, image_url
                               FROM mv_card_comps WHERE player = %s ORDER BY sales DESC, median_price DESC LIMIT 6""", (name,))
             b["subject_firsts"] = q("""SELECT id, kind, headline, first_date, threshold, value, score, published_on
@@ -283,23 +320,27 @@ def bundle(mid):
 
     # Day / week milestones: what made the day.
     if m["kind"] in ("count:day", "gmv:day", "count:week", "gmv:week"):
-        d0 = m["first_date"] if m["kind"].endswith("day") else m["first_date"]
+        d0 = m["first_date"]
         span = 0 if m["kind"].endswith("day") else 6
-        flt = "vertical <> 'Unknown'" if v == "All" else "vertical = %s"
-        params = [] if v == "All" else [v]
-        subj = "" if not named_subject(m) else " AND firsts_subject(vertical, player, title) = %s"
-        if subj:
-            params.append(m["subject"])
+        start = d0 - (span and __import__("datetime").timedelta(days=span))
+        if named_subject(m):
+            src, params = subject_source(v, m["subject"])
+            where = "sold_date BETWEEN %s AND %s AND total_price >= %s"
+            frm = src
+        elif v == "All":
+            frm, params, where = "sales", (), "is_publishable AND vertical <> 'Unknown' AND sold_date BETWEEN %s AND %s AND total_price >= %s"
+        else:
+            frm, params, where = "sales", (v,), "is_publishable AND vertical = %s AND sold_date BETWEEN %s AND %s AND total_price >= %s"
         floor = float(m["floor"]) if m["kind"].startswith("count") else float(w["floor"])
         b["day_top"] = q(f"""SELECT item_id, title, total_price, sold_date, grade_label, url, image_url
-                             FROM sales WHERE is_publishable AND {flt}{subj}
-                               AND sold_date BETWEEN %s AND %s AND total_price >= %s
-                             ORDER BY total_price DESC LIMIT 6""", (*params, d0 - (span and __import__("datetime").timedelta(days=span)), d0, floor))
+                             FROM {frm}
+                             WHERE {where}
+                             ORDER BY total_price DESC LIMIT 6""", (*params, start, d0, floor))
         b["day_stats"] = q(f"""SELECT count(*) AS n, sum(total_price) AS gmv, percentile_cont(0.5) WITHIN GROUP (ORDER BY total_price) AS median_price,
                                       count(*) FILTER (WHERE listing_format = 'Auction') AS auctions
-                               FROM sales WHERE is_publishable AND {flt}{subj}
-                                 AND sold_date BETWEEN %s AND %s AND total_price >= %s""",
-                           (*params, d0 - (span and __import__("datetime").timedelta(days=span)), d0, floor))[0]
+                               FROM {frm}
+                               WHERE {where}""",
+                           (*params, start, d0, floor))[0]
 
     # Index milestones: the series, with the level.
     if m["kind"].startswith("index:"):

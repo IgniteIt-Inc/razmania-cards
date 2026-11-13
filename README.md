@@ -326,7 +326,8 @@ year; day, week and cumulative counts and volume; index levels);
 `publish_firsts()` picks the day's 1–3 by an editorial score with rules
 against repetition. `api/firsts.py` renders each as a full server-side
 article with NewsArticle markup, charts and the subject's numbers, and the
-plugin hosts it at `/firsts/<id>-<slug>/` with a news sitemap. The page also
+plugin hosts it at `/firsts/<id>-<slug>/` with a news sitemap at
+`/firsts/sitemap.xml`. The page also
 carries the hobby's hand-researched all-time firsts ($10K / $100K / $1M /
 $10M per category), each cell with a printed status. A tracked first is never
 called "first ever". Brief, rules and worksheet: `firsts/README.md`.

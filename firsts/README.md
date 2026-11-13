@@ -121,8 +121,10 @@ charts are inline SVG.
 WordPress hosts it: `/firsts/<id>-<slug>/` fetches
 `/firsts/a/<id>?fragment=1` (meta + HTML + CSS, cached a day), prints its own
 title, canonical, Open Graph, `article:published_time` and the JSON-LD, and
-renders inside the theme. `/firsts-sitemap.xml` lists every article with
+renders inside the theme. `/firsts/sitemap.xml` lists every article with
 `news:news` tags for the last two days, and is appended to robots.txt.
+`/firsts-sitemap.xml` 301s there: Rank Math claims every `*-sitemap.xml`
+URL and was returning the theme 404 for the old path.
 `[razmania_firsts_today]` is the homepage module (also injected at the top
 of the front page while the setting is on).
 
